@@ -1,0 +1,445 @@
+<script>
+// --- CONFIG ---
+const COST_COLS = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const ASPECT_COLS = ["Aggression", "Command", "Cunning", "Vigilance", "Villainy", "Heroism"];
+
+// --- APP STATE ---
+let myDeck = {};
+let currentView = [];
+let areSpecialColsVisible = true; 
+let currentSortMode = 'cost'; 
+let CARD_DATABASE = {}; 
+
+// --- API HELPERS ---
+function mapApiType(cardData) {
+    if (!cardData.Type) return "Unit";
+    const t = cardData.Type.toLowerCase();
+    if (t.includes("leader")) return "Leader";
+    if (t.includes("base")) return "Base";
+    return "Unit";
+}
+
+function mapApiAspect(cardData) {
+    const aspects = cardData.Aspects || [];
+    const mainColors = ["Aggression", "Command", "Cunning", "Vigilance"];
+    for (let a of aspects) {
+        if (mainColors.includes(a)) return a;
+    }
+    return aspects.length > 0 ? aspects[0] : "Villainy";
+}
+
+// --- FETCH DATA (MED RARITY) ---
+async function fetchSetData(setCode) {
+    const statusEl = document.getElementById('data-status');
+    const lowerSet = setCode.toLowerCase();
+    
+    // Tjek Cache
+    const cacheKey = `SWU_V5_RARITY_${setCode}`; // Ny version
+    const cached = localStorage.getItem(cacheKey);
+    if (cached) {
+        CARD_DATABASE[setCode] = JSON.parse(cached);
+        return CARD_DATABASE[setCode];
+    }
+
+    statusEl.innerText = "Henter Data...";
+    statusEl.className = "status-loading";
+
+    try {
+        const targetUrl = `https://api.swu-db.com/cards/search?q=set:${lowerSet}&pretty=false`;
+        // Vi bruger allorigins som er meget stabil
+        const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`);
+        
+        if (!res.ok) throw new Error("Proxy Fejl");
+        const data = await res.json();
+        
+        // Vi sorterer data i arrays for nemmere pakke-generering
+        const processedSet = { 
+            leaders: [], 
+            bases: [], 
+            commons: [], 
+            uncommons: [], 
+            rares: [] // Inkluderer også Legendary
+        };
+
+        data.forEach(card => {
+            const idFormatted = card.Number.toString().padStart(3, '0');
+            const type = mapApiType(card);
+            
+            // Image URL fallback logic
+            let frontImg = card.FrontArt || `https://swudb.com/images/cards/${setCode}/${idFormatted}.png`;
+            let backImg = card.BackArt;
+            if (type === 'Leader' && !backImg) backImg = `https://swudb.com/images/cards/${setCode}/${idFormatted}-back.png`;
+
+            const cardObj = {
+                id: idFormatted,
+                set: setCode,
+                name: card.Name,
+                type: type,
+                rarity: card.Rarity ? card.Rarity.toLowerCase() : "common", // Hent Rarity!
+                cost: (card.Cost !== undefined && card.Cost !== null) ? card.Cost.toString() : "0",
+                aspect: mapApiAspect(card),
+                img: frontImg,
+                back: backImg
+            };
+
+            // Sorter i de rigtige bunker
+            if (type === 'Leader') {
+                processedSet.leaders.push(cardObj);
+            } else if (type === 'Base') {
+                processedSet.bases.push(cardObj);
+            } else {
+                // Det er en Unit/Event/Upgrade - Sorter efter rarity
+                if (cardObj.rarity === 'common') processedSet.commons.push(cardObj);
+                else if (cardObj.rarity === 'uncommon') processedSet.uncommons.push(cardObj);
+                else processedSet.rares.push(cardObj); // Rare + Legendary
+            }
+        });
+
+        CARD_DATABASE[setCode] = processedSet;
+        try { localStorage.setItem(cacheKey, JSON.stringify(processedSet)); } catch(e){}
+        
+        statusEl.innerText = "Data OK";
+        statusEl.className = "status-ok";
+        return processedSet;
+
+    } catch (err) {
+        console.warn(err);
+        statusEl.innerText = "Netværksfejl - Prøv igen";
+        statusEl.className = "status-error";
+        return null;
+    }
+}
+
+// --- DEN NYE PACK GENERATOR (REALISTISK) ---
+async function openPacks() {
+    const btn = document.getElementById('btn-open');
+    const setCode = document.getElementById('setSelect').value;
+    const packCount = parseInt(document.getElementById('packCount').value) || 6;
+    
+    btn.disabled = true;
+    playAudio('snd-cantina');
+
+    let setData = await fetchSetData(setCode);
+    
+    // Simpel fallback hvis data mangler (for at undgå crash)
+    if (!setData || setData.commons.length === 0) {
+        alert("Kunne ikke hente kortdata. Prøv at genindlæse siden.");
+        btn.disabled = false;
+        return;
+    }
+
+    currentView = [];
+
+    for(let i=0; i<packCount; i++) {
+        // 1. Tilføj 1 Leader
+        if (setData.leaders.length > 0) {
+            addCardToView(setData.leaders, 'Leader');
+        }
+
+        // 2. Tilføj 1 Base
+        if (setData.bases.length > 0) {
+            addCardToView(setData.bases, 'Base');
+        }
+
+        // 3. Tilføj 9 Commons
+        for(let c=0; c<9; c++) {
+            if(setData.commons.length > 0) addCardToView(setData.commons);
+        }
+
+        // 4. Tilføj 3 Uncommons
+        for(let u=0; u<3; u++) {
+            if(setData.uncommons.length > 0) addCardToView(setData.uncommons);
+        }
+
+        // 5. Tilføj 1 Rare eller Legendary
+        if(setData.rares.length > 0) {
+            addCardToView(setData.rares);
+        }
+        
+        // 6. Foil slot? (Vi bruger en tilfældig Common til at simulere det sidste kort for nu, så vi rammer 16 kort totalt inkl leader/base)
+        if(setData.commons.length > 0) addCardToView(setData.commons);
+    }
+
+    renderBoard();
+    btn.disabled = false;
+}
+
+// Hjælpefunktion til at trække et tilfældigt kort fra en liste
+function addCardToView(cardList, forceCol = null) {
+    const card = cardList[Math.floor(Math.random() * cardList.length)];
+    
+    // Bestem kolonne
+    let col = "1";
+    if (forceCol) col = forceCol;
+    else if (currentSortMode === 'cost') col = (parseInt(card.cost) > 8) ? "8" : card.cost;
+    else col = card.aspect;
+
+    currentView.push({ 
+        ...card, 
+        uid: Date.now() + Math.random(), // Unikt ID til DOM
+        column: col 
+    });
+}
+
+// --- INIT BOARD ---
+function initBoard() {
+    const board = document.getElementById('board');
+    board.innerHTML = '';
+    
+    let activeCols = [];
+    if (currentSortMode === 'cost') {
+        activeCols = ["Leader", "Base", "Pool", ...COST_COLS];
+    } else {
+        activeCols = ["Leader", "Base", "Pool", ...ASPECT_COLS];
+    }
+
+    activeCols.forEach(colName => {
+        const col = document.createElement('div');
+        col.id = `col-${colName}`;
+        
+        let cssClass = 'column';
+        if (colName === "Leader" || colName === "Base") cssClass += ' col-special';
+        if (colName === "Pool") cssClass += ' col-pool'; 
+        
+        col.className = cssClass;
+        
+        col.ondragover = (e) => { e.preventDefault(); col.classList.add('drag-over'); };
+        col.ondragleave = (e) => { col.classList.remove('drag-over'); };
+        col.ondrop = (e) => handleDropOnBoard(e, colName);
+
+        let headerClass = "ch-cost";
+        if (colName === "Leader") headerClass = "ch-Leader";
+        else if (colName === "Base") headerClass = "ch-Base";
+        else if (colName === "Pool") headerClass = "ch-Pool";
+        else if (ASPECT_COLS.includes(colName)) headerClass = `ch-${colName}`;
+
+        col.innerHTML = `
+            <div class="col-header ${headerClass}">${colName}</div>
+            <div class="col-content" id="list-${colName}"></div>
+        `;
+        board.appendChild(col);
+    });
+
+    const sidebar = document.getElementById('sidebar');
+    sidebar.ondragover = (e) => { e.preventDefault(); sidebar.classList.add('drag-over-deck'); };
+    sidebar.ondragleave = (e) => { sidebar.classList.remove('drag-over-deck'); };
+    sidebar.ondrop = (e) => handleDropOnDeck(e);
+    
+    toggleLeadersBases(true);
+
+    document.addEventListener('keydown', function(e) {
+        if (e.code === 'Space' && document.getElementById('modal').style.display === 'flex') {
+            e.preventDefault(); flipLeader();
+        }
+    });
+}
+
+function prefetchData() {
+    const setCode = document.getElementById('setSelect').value;
+    fetchSetData(setCode); 
+}
+
+// --- RENDER ---
+function renderBoard() {
+    const allCols = ["Leader", "Base", "Pool", ...COST_COLS, ...ASPECT_COLS];
+    allCols.forEach(c => {
+        const el = document.getElementById(`list-${c}`);
+        if(el) el.innerHTML = '';
+    });
+
+    const map = {};
+    currentView.forEach(c => {
+        let target = c.column;
+        if (c.type !== 'Leader' && c.type !== 'Base') {
+             if (currentSortMode === 'cost') target = (parseInt(c.cost)>8)?"8":c.cost;
+             else target = c.aspect;
+        }
+        c.column = target;
+        
+        const key = `${c.id}_${c.column}`;
+        if(map[key]) map[key].count++; else map[key] = {...c, count:1};
+    });
+
+    document.getElementById('s-total').innerText = currentView.length;
+
+    Object.values(map).forEach(c => {
+        const target = document.getElementById(`list-${c.column}`) || document.getElementById('list-Pool');
+        if(!target) return;
+
+        const cardEl = document.createElement('div');
+        cardEl.className = `card-item`;
+        cardEl.draggable = true;
+        
+        // Gem data til drag/drop
+        cardEl.ondragstart = (e) => {
+            const payload = JSON.stringify({id: c.id, set: c.set});
+            e.dataTransfer.setData("text/plain", payload);
+        };
+        cardEl.onclick = (e) => { if(e.target.tagName !== 'DIV') openModal(c); };
+        cardEl.onmouseenter = (e) => showPreview(e, c.img, c.type); 
+        cardEl.onmouseleave = hidePreview;
+        cardEl.onmousemove = (e) => movePreview(e);
+
+        // Rarity farve indikator (lille streg i bunden)
+        let rarityColor = "#fff";
+        if(c.rarity === 'legendary') rarityColor = "#ebda44";
+        if(c.rarity === 'rare') rarityColor = "#c9b038";
+        if(c.rarity === 'uncommon') rarityColor = "#silver";
+        if(c.rarity === 'common') rarityColor = "#cd7f32";
+
+        const stackHtml = c.count > 1 ? `<div class="stack-badge">${c.count}</div>` : '';
+        cardEl.innerHTML = `
+            ${stackHtml}
+            <img src="${c.img}" draggable="false" style="border-bottom: 2px solid ${rarityColor}">
+            <div class="card-actions" onclick="addToDeck('${c.id}', '${c.set}')">
+                <div class="add-icon">+</div>
+            </div>
+        `;
+        target.appendChild(cardEl);
+    });
+}
+
+// --- UTILS ---
+function toggleSort() {
+    const btn = document.getElementById('btn-sort');
+    currentSortMode = (currentSortMode === 'cost') ? 'aspect' : 'cost';
+    btn.innerText = `Sorter: ${currentSortMode === 'cost' ? 'Cost' : 'Aspect'}`;
+    initBoard();
+    renderBoard();
+}
+
+function toggleLeadersBases(maintain) {
+    if(!maintain) areSpecialColsVisible = !areSpecialColsVisible;
+    document.getElementById('col-Leader').style.display = areSpecialColsVisible ? 'flex' : 'none';
+    document.getElementById('col-Base').style.display = areSpecialColsVisible ? 'flex' : 'none';
+    document.getElementById('btn-toggle-lb').innerText = areSpecialColsVisible ? "Skjul L/B" : "Vis L/B";
+}
+
+function addToDeck(id, setCode) {
+    const idx = currentView.findIndex(c => c.id === id && c.set === setCode);
+    if (idx === -1) return;
+    const card = currentView[idx];
+    currentView.splice(idx, 1); 
+    const key = `${card.set}_${card.id}`;
+    if(myDeck[key]) myDeck[key].count++; else myDeck[key] = { ...card, count: 1 }; 
+    renderBoard(); updateSidebar();
+}
+
+function removeFromDeck(key) {
+    if(!myDeck[key]) return;
+    const card = myDeck[key];
+    card.count--;
+    if(card.count <= 0) delete myDeck[key];
+    
+    let retCol = card.cost;
+    if (currentSortMode === 'cost') retCol = parseInt(card.cost) > 8 ? "8" : card.cost;
+    else retCol = card.aspect;
+    if (card.type === 'Leader') retCol = 'Leader';
+    if (card.type === 'Base') retCol = 'Base';
+
+    currentView.push({ ...card, count: undefined, uid: Date.now(), column: retCol });
+    renderBoard(); updateSidebar();
+}
+
+function updateSidebar() {
+    const ul = document.getElementById('deck-list'); ul.innerHTML = '';
+    let sum = 0;
+    Object.values(myDeck).sort((a,b) => a.name.localeCompare(b.name)).forEach(c => {
+        sum += c.count;
+        const li = document.createElement('li');
+        li.style.borderLeftColor = `var(--c-${c.type === 'Leader' ? 'leader' : c.type === 'Base' ? 'base' : 'unit'})`;
+        li.innerHTML = `<span>${c.name}</span> <span style="color:var(--accent); font-weight:bold;">${c.count}</span>`;
+        li.onclick = () => removeFromDeck(`${c.set}_${c.id}`);
+        li.onmouseenter = (e) => showPreview(e, c.img, c.type);
+        li.onmouseleave = hidePreview;
+        li.onmousemove = (e) => movePreview(e);
+        ul.appendChild(li);
+    });
+    document.getElementById('deck-count').innerText = sum;
+}
+
+function clearDeck() { 
+    Object.values(myDeck).forEach(c => {
+        for(let i=0; i<c.count; i++) {
+             let retCol = (currentSortMode === 'cost') ? (parseInt(c.cost)>8?"8":c.cost) : c.aspect;
+             if (c.type === 'Leader') retCol = 'Leader';
+             if (c.type === 'Base') retCol = 'Base';
+             currentView.push({ ...c, count: undefined, column: retCol, uid: `ret-${i}` });
+        }
+    });
+    myDeck = {}; 
+    renderBoard();
+    updateSidebar(); 
+}
+function clearCache() { localStorage.clear(); alert("Cache ryddet!"); location.reload(); }
+
+function playAudio(id) { const s=document.getElementById(id); if(s){s.volume=0.4; s.currentTime=0; s.play().catch(e=>{});} }
+function handleDropOnDeck(e) { e.preventDefault(); try{const d=JSON.parse(e.dataTransfer.getData("text/plain")); if(d.id) addToDeck(d.id, d.set);}catch(e){} document.getElementById('sidebar').classList.remove('drag-over-deck'); }
+function handleDropOnBoard(e) { e.preventDefault(); }
+
+const tooltip = document.getElementById('preview-tooltip');
+function showPreview(e, src, type) {
+    tooltip.innerHTML = `<img src="${src}">`;
+    tooltip.className = (type === 'Leader' || type === 'Base') ? 'big-preview' : '';
+    tooltip.style.display = 'block';
+    movePreview(e);
+}
+function movePreview(e) {
+    const w = window.innerWidth;
+    let tooltipW = 320;
+    if (tooltip.classList.contains('big-preview')) {
+        tooltipW = 600; 
+    }
+    
+    let x = e.clientX + 20; 
+    let y = e.clientY + 10;
+
+    if (x + tooltipW > w) {
+        x = e.clientX - tooltipW - 20;
+    }
+
+    const h = tooltip.offsetHeight || 400;
+    const winH = window.innerHeight;
+    if (y + h > winH) {
+        y = winH - h - 20; 
+    }
+
+    tooltip.style.top = y + 'px';
+    tooltip.style.left = x + 'px';
+}
+function hidePreview(){tooltip.style.display='none';}
+
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modal-img');
+const modalFlipBtn = document.getElementById('modal-flip-btn');
+let currentZoomCard = null;
+
+function openModal(c) {
+    currentZoomCard=c; modal.style.display='flex';
+    if(c.type==='Leader') { 
+        modalImg.src=c.img; 
+        modalFlipBtn.style.display='block'; 
+    } else { 
+        modalImg.src=c.img; 
+        modalFlipBtn.style.display='none'; 
+    }
+}
+function flipLeader(e) {
+    if(e) e.stopPropagation();
+    if(!currentZoomCard || currentZoomCard.type !== 'Leader') return;
+    const isBack = modalImg.src.includes("face=true") || modalImg.src.includes("-back"); 
+    modalImg.src = isBack ? currentZoomCard.img : currentZoomCard.back;
+}
+function closeModal() { modal.style.display='none'; }
+
+function copyJSON() { 
+    const d={metadata:{name:"Sealed",author:"SWU"},leader:null,base:null,deck:[],sideboard:[]};
+    Object.values(myDeck).forEach(c=>{ const e={id:`${c.set}_${c.id}`,count:c.count}; if(c.type==='Leader') d.leader=e; else if(c.type==='Base') d.base=e; else d.deck.push(e); });
+    const el=document.createElement('textarea'); el.value=JSON.stringify(d,null,2); document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); playAudio('snd-copy'); 
+    document.getElementById('toast').className = 'show'; setTimeout(()=>document.getElementById('toast').className='', 2000);
+}
+
+window.onload = function() { initBoard(); prefetchData(); };
+</script>
+</body>
+</html>
